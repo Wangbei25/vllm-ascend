@@ -81,25 +81,29 @@ Run the following script to execute online inference.
 ```shell
 #!/bin/sh
 
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export VLLM_USE_V1=1
+export VLLM_ASCEND_ENABLE_NZ=0
+export TOKENIZERS_PARALLELISM=false
+export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export TASK_QUEUE_ENABLE=1
+export TOKENIZERS_PARALLELISM=false
 
 vllm serve /weights/DeepSeek-OCR-2 \
---host 0.0.0.0 \
---port 8015 \
---tensor-parallel-size 1 \
---quantization ascend \
---seed 1024 \
---served-model-name deepseekocr2 \
---async-scheduling \
---max-model-len 8192 \
---trust-remote-code \
---no-enable-prefix-caching \
---gpu-memory-utilization 0.9 \
---compilation-config '{"cudagraph_capture_sizes":[1,2,4,8,16], "cudagraph_mode": "FULL_DECODE_ONLY"}' \
---additional-config '{"multistream_overlap_shared_expert":true, "enable_cpu_binding":true,"ascend_compilation_config": {"fuse_qknorm_rope": false}}' \
---mm-processor-cache-gb 0 \
+    --served-model-name deepseekocr2 \
+    --trust-remote-code \
+    -tp 1  \
+    --port 1055 \
+    --max_model_len 8192 \
+    --no-enable-prefix-caching \
+    --gpu-memory-utilization 0.8 \
+    --allowed-local-media-path / \
+    --async-scheduling \
+    --additional-config '{
+      "enable_cpu_binding": true,
+      "multistream_overlap_shared_expert": true,
+      "ascend_compilation_config": {"fuse_qknorm_rope": false}
+    }' \
+    --mm-processor-cache-gb 0
 ```
 
 ### Multi-node Deployment
@@ -107,6 +111,7 @@ vllm serve /weights/DeepSeek-OCR-2 \
 Single-node deployment is recommended.
 
 ### Prefill-Decode Disaggregation
+
 We don't neel to Prefill-Decode disaggregation
 
 ## Functional Verification
@@ -164,4 +169,3 @@ The performance result is:
 **Input/Output**: 1080P/256
 
 **Performance**: TTFT = 2s, TPOT = 200ms, Average performance of each card is 864 TPS (Token Per Second).
-
