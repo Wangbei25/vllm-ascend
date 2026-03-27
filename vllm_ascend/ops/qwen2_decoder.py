@@ -115,7 +115,7 @@ class AscendCustomQwen2Decoder(CustomQwen2Decoder):
                 """
                 4D Mask generation optimized for NPU
                 vector parallel implementation, replacing the original loop implementation
-                """ 
+                """
                 dtype, device = input_tensor.dtype, input_tensor.device
                 min_dtype = torch.finfo(dtype).min
                 batch_size, sequence_length = input_tensor.shape[0], input_tensor.shape[1]
