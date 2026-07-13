@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import logging
 from dataclasses import dataclass
 from enum import Enum
 
@@ -23,6 +24,7 @@ import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
     AttentionBackend,
@@ -298,6 +300,26 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             seq_lens = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
 
         slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens]
+        if self.speculative_config is not None and logger.isEnabledFor(
+            logging.DEBUG
+        ):
+            logger.debug(
+                "MTP/prefix attention metadata: common_prefix_len=%d num_reqs=%d "
+                "num_actual_tokens=%d num_decode_tokens=%d num_prefill_tokens=%d "
+                "query_lens=%s seq_lens=%s block_table_shape=%s "
+                "block_table_ptr=%s slot_mapping_shape=%s slot_mapping_ptr=%s",
+                common_prefix_len,
+                num_reqs,
+                num_actual_tokens,
+                num_decode_tokens,
+                num_prefill_tokens,
+                (query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).tolist(),
+                seq_lens.tolist(),
+                tuple(block_table.shape) if block_table is not None else None,
+                block_table.data_ptr() if block_table is not None else None,
+                tuple(slot_mapping.shape),
+                slot_mapping.data_ptr(),
+            )
         # this slot_mapping override doesn't work since vllm will override it again. We should fix it vllm.
         # see: https://github.com/vllm-project/vllm/blob/ce88756b967c2c5006746a424c15dd59a284ed8c/vllm/model_executor/layers/attention/cross_attention.py#L117
         if isinstance(self.kv_cache_spec, CrossAttentionSpec):

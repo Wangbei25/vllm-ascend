@@ -1,6 +1,9 @@
+import logging
+
 import numpy as np
 import torch
 from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec, UniformTypeKVCacheSpecs
@@ -189,6 +192,52 @@ class BlockTable:
             # IMPORTANT: In hybrid mode, positions are in logical block space,
             # but we need to map them to the correct logical block table indices
             logical_block_idx = positions // self.block_size
+
+            if req_indices.size:
+                invalid_req_mask = (req_indices < 0) | (
+                    req_indices >= self.max_num_reqs
+                )
+                valid_req_mask = ~invalid_req_mask
+                missing_block_mask = np.zeros(req_indices.shape, dtype=bool)
+                missing_block_mask[valid_req_mask] = (
+                    logical_block_idx[valid_req_mask]
+                    >= self.num_blocks_per_row[req_indices[valid_req_mask]]
+                )
+                if invalid_req_mask.any() or missing_block_mask.any():
+                    bad = np.flatnonzero(invalid_req_mask | missing_block_mask)[:16]
+                    logger.warning(
+                        "MTP slot mapping references unallocated KV blocks: "
+                        "bad_token_indices=%s req_indices=%s positions=%s "
+                        "logical_block_indices=%s allocated_blocks=%s "
+                        "block_size=%d max_blocks_per_req=%d",
+                        bad.tolist(),
+                        req_indices[bad].tolist(),
+                        positions[bad].tolist(),
+                        logical_block_idx[bad].tolist(),
+                        [
+                            int(self.num_blocks_per_row[req_idx])
+                            if 0 <= req_idx < self.max_num_reqs
+                            else -1
+                            for req_idx in req_indices[bad]
+                        ],
+                        self.block_size,
+                        self.max_num_blocks_per_req,
+                    )
+                elif logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "MTP slot mapping: num_tokens=%d req_range=[%d,%d] "
+                        "position_range=[%d,%d] logical_block_range=[%d,%d] "
+                        "allocated_blocks_range=[%d,%d]",
+                        req_indices.size,
+                        int(req_indices.min()),
+                        int(req_indices.max()),
+                        int(positions.min()),
+                        int(positions.max()),
+                        int(logical_block_idx.min()),
+                        int(logical_block_idx.max()),
+                        int(self.num_blocks_per_row[req_indices].min()),
+                        int(self.num_blocks_per_row[req_indices].max()),
+                    )
 
             # Account for the expanded logical table
             # (always needed with unified tensor)

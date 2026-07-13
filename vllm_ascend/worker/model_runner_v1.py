@@ -898,6 +898,42 @@ class NPUModelRunner(GPUModelRunner):
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
 
+        if logger.isEnabledFor(logging.DEBUG):
+            block_table_state = []
+            for group_id, block_table in enumerate(
+                self.input_batch.block_table.block_tables
+            ):
+                request_rows = []
+                for req_idx in range(num_reqs):
+                    num_blocks = int(block_table.num_blocks_per_row[req_idx])
+                    block_ids = block_table.block_table.np[req_idx, :num_blocks]
+                    request_rows.append(
+                        {
+                            "req_id": self.input_batch.req_ids[req_idx],
+                            "num_blocks": num_blocks,
+                            "tail_block_ids": block_ids[-4:].tolist(),
+                        }
+                    )
+                block_table_state.append(
+                    {"group_id": group_id, "requests": request_rows}
+                )
+            logger.debug(
+                "KV/MTP batch state after block-table commit: "
+                "num_reqs=%d total_scheduled_tokens=%d scheduled_tokens=%s "
+                "num_computed_tokens=%s common_prefix_blocks=%s "
+                "scheduled_spec_tokens=%s block_tables=%s",
+                num_reqs,
+                total_num_scheduled_tokens,
+                num_scheduled_tokens.tolist(),
+                self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
+                scheduler_output.num_common_prefix_blocks,
+                {
+                    req_id: len(token_ids)
+                    for req_id, token_ids in scheduler_output.scheduled_spec_decode_tokens.items()
+                },
+                block_table_state,
+            )
+
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
 
         # Get the attention state.
