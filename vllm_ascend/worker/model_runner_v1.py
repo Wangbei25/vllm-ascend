@@ -44,10 +44,12 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_pcp_group, get_pp_group, get_tp_group
 from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context
 from vllm.logger import logger
+from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionLayer
+from vllm.model_executor.models.interfaces import supports_multimodal_pruning
 from vllm.sequence import IntermediateTensors
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv, round_up
@@ -109,6 +111,7 @@ from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBui
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -126,6 +129,7 @@ from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.quantization.utils import enable_fa_quant
+from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
@@ -175,20 +179,11 @@ from vllm_ascend.ascend_forward_context import (  # isort: skip
     set_mc2_tokens_capacity,
 )
 
-from vllm.model_executor.models.interfaces import supports_multimodal_pruning
-
-from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
-
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
-
-
-from vllm.model_executor.layers.attention import Attention, MLAAttention
-
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
 torch.npu.config.allow_internal_format = True
@@ -198,6 +193,18 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+SPEC_DECODE_DEBUG_PREVIEW = 8
+
+
+def _debug_array_summary(value, limit: int = SPEC_DECODE_DEBUG_PREVIEW):
+    if value is None:
+        return None
+    try:
+        if isinstance(value, torch.Tensor):
+            return value.detach().flatten()[:limit].cpu().tolist()
+        return np.asarray(value).reshape(-1)[:limit].tolist()
+    except Exception as exc:  # pragma: no cover - best-effort diagnostics.
+        return [f"<summary failed: {exc}>"]
 
 
 @dataclass
@@ -1105,6 +1112,19 @@ class NPUModelRunner(GPUModelRunner):
             and self.valid_sampled_token_count_gpu is not None # type: ignore[has-type]
             and prev_req_id_to_index
         ):
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[spec_decode/async_metadata] correcting GPU"
+                    " num_computed_tokens: num_reqs=%s prev_positions=%s"
+                    " prev_num_draft_tokens=%s valid_sampled_counts=%s"
+                    " cpu_num_computed=%s num_accepted_before=%s",
+                    num_reqs,
+                    _debug_array_summary(self.prev_positions.np[:num_reqs]),
+                    _debug_array_summary(self.prev_num_draft_tokens.np[:num_reqs]),
+                    _debug_array_summary(self.valid_sampled_token_count_gpu),
+                    _debug_array_summary(computed_token_tensor_cpu),
+                    _debug_array_summary(self.num_accepted_tokens.gpu[:num_reqs]),
+                )
             self.prev_positions.copy_to_gpu(num_reqs)
             self.prev_num_draft_tokens.copy_to_gpu()
             update_num_computed_tokens_for_batch_change(
@@ -1115,6 +1135,14 @@ class NPUModelRunner(GPUModelRunner):
                 self.prev_num_draft_tokens.gpu,
                 computed_token_tensor_cpu,
             )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[spec_decode/async_metadata] corrected GPU"
+                    " num_computed_tokens: num_computed=%s"
+                    " num_accepted=%s",
+                    _debug_array_summary(self.num_computed_tokens[:num_reqs]),
+                    _debug_array_summary(self.num_accepted_tokens.gpu[:num_reqs]),
+                )
         else:
             self.num_computed_tokens[:num_reqs].copy_(
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
@@ -1257,6 +1285,18 @@ class NPUModelRunner(GPUModelRunner):
         )
         if self._needs_seq_lens_cpu_sync and async_spec_decode_active:
             self._correct_optimistic_seq_lens_cpu(num_reqs)
+        elif logger.isEnabledFor(logging.DEBUG) and self.use_async_spec_decode:
+            logger.debug(
+                "[spec_decode/async_metadata] skip optimistic seq_lens CPU"
+                " correction: needs_sync=%s active=%s valid_counts=%s"
+                " has_prev=%s seq_lens=%s optimistic_seq_lens_cpu=%s",
+                self._needs_seq_lens_cpu_sync,
+                async_spec_decode_active,
+                self.valid_sampled_token_count_gpu is not None,
+                bool(prev_req_id_to_index),
+                _debug_array_summary(self.seq_lens[:num_reqs]),
+                _debug_array_summary(self.optimistic_seq_lens_cpu[:num_reqs]),
+            )
 
         # For non-PCP, compute slot_mapping on GPU. PCP slot_mapping was
         # already computed on GPU before PCP split the positions.
@@ -1324,6 +1364,26 @@ class NPUModelRunner(GPUModelRunner):
             self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
             self.num_decode_draft_tokens.copy_to_gpu()
+
+        if logger.isEnabledFor(logging.DEBUG) and use_spec_decode:
+            logger.debug(
+                "[spec_decode/async_metadata] prepared target metadata:"
+                " num_reqs=%s total_tokens=%s use_async=%s prefix_cache=%s"
+                " query_start_cpu=%s seq_lens=%s optimistic_seq_lens_cpu=%s"
+                " positions=%s slot_mapping=%s num_draft_tokens=%s"
+                " scheduled_spec_req_count=%s",
+                num_reqs,
+                total_num_scheduled_tokens,
+                self.use_async_spec_decode,
+                self.vllm_config.cache_config.enable_prefix_caching,
+                _debug_array_summary(self.query_start_loc.cpu[: num_reqs + 1]),
+                _debug_array_summary(self.seq_lens[:num_reqs]),
+                _debug_array_summary(self.optimistic_seq_lens_cpu[:num_reqs]),
+                _debug_array_summary(self.positions[:total_num_scheduled_tokens]),
+                _debug_array_summary(self.input_batch.block_table[0].slot_mapping.gpu[:total_num_scheduled_tokens]),
+                _debug_array_summary(num_draft_tokens),
+                len(scheduler_output.scheduled_spec_decode_tokens),
+            )
         # save logits_indices for pcp spec decode usage
         self.logits_indices = logits_indices
 
@@ -1650,6 +1710,18 @@ class NPUModelRunner(GPUModelRunner):
         assert self.valid_sampled_token_count_event is not None
         assert self.valid_sampled_token_count_cpu is not None
         self.valid_sampled_token_count_event.synchronize()
+        if logger.isEnabledFor(logging.DEBUG):
+            before = self.optimistic_seq_lens_cpu[:num_reqs].clone()
+            logger.debug(
+                "[spec_decode/async_metadata] correcting optimistic"
+                " seq_lens CPU: num_reqs=%s before=%s prev_positions=%s"
+                " prev_num_draft_tokens=%s valid_sampled_counts=%s",
+                num_reqs,
+                _debug_array_summary(before),
+                _debug_array_summary(self.prev_positions.np[:num_reqs]),
+                _debug_array_summary(self.prev_num_draft_tokens.np[:num_reqs]),
+                _debug_array_summary(self.valid_sampled_token_count_cpu[:num_reqs]),
+            )
         correct_optimistic_seq_lens_cpu(
             self.optimistic_seq_lens_cpu.numpy(),
             self.prev_positions.np,
@@ -1657,6 +1729,12 @@ class NPUModelRunner(GPUModelRunner):
             self.valid_sampled_token_count_cpu.numpy(),
             num_reqs,
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[spec_decode/async_metadata] corrected optimistic"
+                " seq_lens CPU: after=%s",
+                _debug_array_summary(self.optimistic_seq_lens_cpu[:num_reqs]),
+            )
 
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
@@ -1678,6 +1756,14 @@ class NPUModelRunner(GPUModelRunner):
         if self.use_async_spec_decode:
             # Stash for GPU-side correction in _prepare_inputs.
             self.valid_sampled_token_count_gpu = valid_sampled_tokens_count # type: ignore[no-redef]
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[spec_decode/async_metadata] copied valid sampled counts:"
+                " next_token_ids=%s valid_sampled_counts=%s async=%s",
+                _debug_array_summary(next_token_ids),
+                _debug_array_summary(valid_sampled_tokens_count),
+                self.use_async_spec_decode,
+            )
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
     # TODO: Once the PCP features are complete, it will fully inherit the classes from the VLLM community.

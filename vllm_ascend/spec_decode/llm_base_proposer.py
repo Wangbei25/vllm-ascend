@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
+import logging
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
@@ -76,6 +77,7 @@ def patch_tensor_parallel_group(tp_group):
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
+_SPEC_DECODE_DEBUG_PREVIEW = 8
 
 
 # TODO: Remove it when the bug of fx-graph is solved
@@ -139,6 +141,15 @@ def _is_glm_model(model_config) -> bool:
     hf_text_config = getattr(model_config, "hf_text_config", None)
     model_type = getattr(hf_text_config, "model_type", "") or ""
     return "glm" in str(model_type).lower()
+
+
+def _debug_tensor_summary(tensor: torch.Tensor | None, limit: int = _SPEC_DECODE_DEBUG_PREVIEW) -> list[int] | None:
+    if tensor is None:
+        return None
+    try:
+        return tensor.detach().flatten()[:limit].cpu().tolist()
+    except Exception as exc:  # pragma: no cover - best-effort diagnostics.
+        return [f"<summary failed: {exc}>"]
 
 
 class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
@@ -754,6 +765,29 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     ) -> torch.Tensor:
         batch_size = common_attn_metadata.batch_size()
 
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[spec_decode/mtp_metadata] propose start: method=%s batch=%s"
+                " num_reqs=%s num_tokens=%s max_query_len=%s use_graph=%s"
+                " async=%s prefix_cache=%s seq_lens=%s seq_lens_cpu=%s"
+                " _seq_lens_cpu=%s query_start_cpu=%s block_table_shape=%s"
+                " slot_mapping=%s",
+                self.method,
+                batch_size,
+                common_attn_metadata.num_reqs,
+                common_attn_metadata.num_actual_tokens,
+                common_attn_metadata.max_query_len,
+                self.use_cuda_graph,
+                self.use_async_scheduling,
+                self.vllm_config.cache_config.enable_prefix_caching,
+                _debug_tensor_summary(common_attn_metadata.seq_lens),
+                _debug_tensor_summary(common_attn_metadata.seq_lens_cpu),
+                _debug_tensor_summary(common_attn_metadata._seq_lens_cpu),
+                _debug_tensor_summary(common_attn_metadata.query_start_loc_cpu),
+                tuple(common_attn_metadata.block_table_tensor.shape),
+                _debug_tensor_summary(common_attn_metadata.slot_mapping),
+            )
+
         if token_indices_to_sample is None:
             token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1
 
@@ -858,6 +892,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if common_attn_metadata.num_computed_tokens_cpu is not None:
                 common_attn_metadata.num_computed_tokens_cpu = self._adjust_tensor(
                     common_attn_metadata.num_computed_tokens_cpu, num_reqs_padded
+                )
+
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[spec_decode/mtp_metadata] full graph padded metadata:"
+                    " num_reqs=%s padded=%s num_input_tokens=%s"
+                    " batch_desc_reqs=%s seq_lens=%s seq_lens_cpu=%s"
+                    " _seq_lens_cpu=%s query_start_cpu=%s block_table_shape=%s",
+                    common_attn_metadata.num_reqs,
+                    num_reqs_padded,
+                    num_input_tokens,
+                    getattr(batch_descriptor, "num_reqs", None),
+                    _debug_tensor_summary(common_attn_metadata.seq_lens),
+                    _debug_tensor_summary(common_attn_metadata.seq_lens_cpu),
+                    _debug_tensor_summary(common_attn_metadata._seq_lens_cpu),
+                    _debug_tensor_summary(common_attn_metadata.query_start_loc_cpu),
+                    tuple(common_attn_metadata.block_table_tensor.shape),
                 )
 
             if self.pcp_size > 1:
@@ -1750,6 +1801,28 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 block_numbers = clamped_positions[0] // block_size
             else:
                 block_numbers = clamped_positions // block_size
+
+            if logger.isEnabledFor(logging.DEBUG):
+                block_table_width = old_common_metadata.block_table_tensor.shape[1]
+                invalid_block_numbers = (block_numbers < 0) | (block_numbers >= block_table_width)
+                if invalid_block_numbers.any().item():
+                    logger.warning(
+                        "[spec_decode/mtp_metadata] invalid block number before"
+                        " MTP slot mapping: draft_index=%s batch=%s"
+                        " block_size=%s block_table_width=%s positions=%s"
+                        " block_numbers=%s seq_lens=%s seq_lens_cpu=%s"
+                        " _seq_lens_cpu=%s query_start_cpu=%s",
+                        draft_index,
+                        batch_size,
+                        block_size,
+                        block_table_width,
+                        _debug_tensor_summary(clamped_positions[0] if self.uses_mrope else clamped_positions),
+                        _debug_tensor_summary(block_numbers),
+                        _debug_tensor_summary(common_attn_metadata.seq_lens),
+                        _debug_tensor_summary(common_attn_metadata.seq_lens_cpu),
+                        _debug_tensor_summary(common_attn_metadata._seq_lens_cpu),
+                        _debug_tensor_summary(common_attn_metadata.query_start_loc_cpu),
+                    )
             block_ids = old_common_metadata.block_table_tensor.gather(dim=1, index=block_numbers.view(-1, 1))
             block_ids = block_ids.view(-1)
             if self.uses_mrope:
@@ -1761,6 +1834,39 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Otherwise, the KV cache will be inadvertently updated with the
             # padding tokens.
             slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
+            if logger.isEnabledFor(logging.DEBUG):
+                padding_slots = slot_mapping == PADDING_SLOT_ID
+                negative_slots = slot_mapping < 0
+                if (padding_slots | negative_slots).any().item():
+                    logger.debug(
+                        "[spec_decode/mtp_metadata] padded/negative MTP slot"
+                        " mapping: draft_index=%s batch=%s block_size=%s"
+                        " positions=%s block_numbers=%s block_ids=%s"
+                        " slot_mapping=%s exceeds_max_model_len=%s",
+                        draft_index,
+                        batch_size,
+                        block_size,
+                        _debug_tensor_summary(clamped_positions[0] if self.uses_mrope else clamped_positions),
+                        _debug_tensor_summary(block_numbers),
+                        _debug_tensor_summary(block_ids),
+                        _debug_tensor_summary(slot_mapping),
+                        _debug_tensor_summary(exceeds_max_model_len.to(torch.int32)),
+                    )
+                else:
+                    logger.debug(
+                        "[spec_decode/mtp_metadata] MTP slot mapping:"
+                        " draft_index=%s batch=%s block_size=%s"
+                        " positions=%s block_numbers=%s block_ids=%s"
+                        " slot_mapping=%s seq_lens=%s",
+                        draft_index,
+                        batch_size,
+                        block_size,
+                        _debug_tensor_summary(clamped_positions[0] if self.uses_mrope else clamped_positions),
+                        _debug_tensor_summary(block_numbers),
+                        _debug_tensor_summary(block_ids),
+                        _debug_tensor_summary(slot_mapping),
+                        _debug_tensor_summary(common_attn_metadata.seq_lens),
+                    )
             self.slot_mapping_group[draft_index][: slot_mapping.shape[0]].copy_(slot_mapping.to(torch.int32))
             self.slot_mapping_group[draft_index][slot_mapping.shape[0] :].fill_(PADDING_SLOT_ID)
             # Set the address of the attn_metadata.slot_mapping to the self.slot_mapping_group[idx]
