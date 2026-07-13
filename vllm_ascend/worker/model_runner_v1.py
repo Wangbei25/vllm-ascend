@@ -204,6 +204,21 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+SPEC_DECODE_DEBUG_PREVIEW = 16
+
+
+def _debug_array_summary(
+    value: Any,
+    limit: int = SPEC_DECODE_DEBUG_PREVIEW,
+) -> list[Any] | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, torch.Tensor):
+            return value.detach().flatten()[:limit].cpu().tolist()
+        return np.asarray(value).reshape(-1)[:limit].tolist()
+    except Exception as exc:  # pragma: no cover - best-effort diagnostics.
+        return [f"<summary failed: {exc}>"]
 
 
 @dataclass
@@ -811,6 +826,51 @@ class NPUModelRunner(GPUModelRunner):
         # This can be removed after the upstream fix is merged.
         req_data = scheduler_output.scheduled_cached_reqs
 
+        if logger.isEnabledFor(logging.DEBUG):
+            new_reqs = [
+                {
+                    "req_id": req.req_id,
+                    "computed": req.num_computed_tokens,
+                    "block_tails": [blocks[-4:] for blocks in req.block_ids],
+                }
+                for req in scheduler_output.scheduled_new_reqs[
+                    :SPEC_DECODE_DEBUG_PREVIEW
+                ]
+            ]
+            cached_reqs = [
+                {
+                    "req_id": req_id,
+                    "computed": req_data.num_computed_tokens[index],
+                    "new_block_tails": (
+                        [blocks[-4:] for blocks in new_blocks]
+                        if new_blocks is not None
+                        else None
+                    ),
+                    "resumed": req_id in req_data.resumed_req_ids,
+                }
+                for index, (req_id, new_blocks) in enumerate(
+                    zip(req_data.req_ids, req_data.new_block_ids)
+                )
+                if index < SPEC_DECODE_DEBUG_PREVIEW
+            ]
+            logger.debug(
+                "[spec_decode/kv_lifecycle] scheduler delta: "
+                "new_reqs=%s cached_reqs=%s finished=%s preempted=%s "
+                "new_blocks_to_zero=%s block_copies=%s",
+                new_reqs,
+                cached_reqs,
+                list(scheduler_output.finished_req_ids)[
+                    :SPEC_DECODE_DEBUG_PREVIEW
+                ],
+                list(scheduler_output.preempted_req_ids or ())[
+                    :SPEC_DECODE_DEBUG_PREVIEW
+                ],
+                _debug_array_summary(scheduler_output.new_block_ids_to_zero),
+                (scheduler_output.kv_cache_block_copies or [])[
+                    :SPEC_DECODE_DEBUG_PREVIEW
+                ],
+            )
+
         if self.use_async_scheduling:
             for i, req_id in enumerate(req_data.req_ids):
                 req_state = self.requests.get(req_id)
@@ -1228,6 +1288,19 @@ class NPUModelRunner(GPUModelRunner):
             and self.valid_sampled_token_count_gpu is not None # type: ignore[has-type]
             and prev_req_id_to_index
         ):
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[spec_decode/async_metadata] correcting computed tokens: "
+                    "req_ids=%s prev_positions=%s prev_draft_counts=%s "
+                    "valid_sampled_counts=%s cpu_computed=%s",
+                    self.input_batch.req_ids[:SPEC_DECODE_DEBUG_PREVIEW],
+                    _debug_array_summary(self.prev_positions.np[:num_reqs]),
+                    _debug_array_summary(
+                        self.prev_num_draft_tokens.np[:num_reqs]
+                    ),
+                    _debug_array_summary(self.valid_sampled_token_count_gpu),
+                    _debug_array_summary(computed_token_tensor_cpu),
+                )
             self.prev_positions.copy_to_gpu(num_reqs)
             self.prev_num_draft_tokens.copy_to_gpu()
             update_num_computed_tokens_for_batch_change(
@@ -1238,6 +1311,15 @@ class NPUModelRunner(GPUModelRunner):
                 self.prev_num_draft_tokens.gpu,
                 computed_token_tensor_cpu,
             )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[spec_decode/async_metadata] corrected computed tokens: "
+                    "num_computed=%s num_accepted=%s",
+                    _debug_array_summary(self.num_computed_tokens[:num_reqs]),
+                    _debug_array_summary(
+                        self.num_accepted_tokens.gpu[:num_reqs]
+                    ),
+                )
         else:
             self.num_computed_tokens[:num_reqs].copy_(
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
@@ -1388,6 +1470,30 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs,
                 self.query_start_loc.gpu[: num_reqs + 1],
                 self.positions[:total_num_scheduled_tokens],
+            )
+
+        if logger.isEnabledFor(logging.DEBUG) and self.speculative_config:
+            logger.debug(
+                "[spec_decode/target_metadata] prepared target metadata: "
+                "req_ids=%s total_tokens=%s async=%s prefix_cache=%s "
+                "query_start=%s seq_lens=%s optimistic_seq_lens=%s "
+                "positions=%s slot_mapping=%s draft_counts=%s",
+                self.input_batch.req_ids[:SPEC_DECODE_DEBUG_PREVIEW],
+                total_num_scheduled_tokens,
+                self.use_async_spec_decode,
+                self.vllm_config.cache_config.enable_prefix_caching,
+                _debug_array_summary(self.query_start_loc.cpu[: num_reqs + 1]),
+                _debug_array_summary(self.seq_lens[:num_reqs]),
+                _debug_array_summary(self.optimistic_seq_lens_cpu[:num_reqs]),
+                _debug_array_summary(
+                    self.positions[:total_num_scheduled_tokens]
+                ),
+                _debug_array_summary(
+                    self.input_batch.block_table[0].slot_mapping.gpu[
+                        :total_num_scheduled_tokens
+                    ]
+                ),
+                _debug_array_summary(num_draft_tokens),
             )
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
@@ -1773,6 +1879,20 @@ class NPUModelRunner(GPUModelRunner):
         assert self.valid_sampled_token_count_event is not None
         assert self.valid_sampled_token_count_cpu is not None
         self.valid_sampled_token_count_event.synchronize()
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[spec_decode/async_metadata] correcting optimistic seq_lens: "
+                "before=%s prev_positions=%s prev_draft_counts=%s "
+                "valid_sampled_counts=%s",
+                _debug_array_summary(self.optimistic_seq_lens_cpu[:num_reqs]),
+                _debug_array_summary(self.prev_positions.np[:num_reqs]),
+                _debug_array_summary(
+                    self.prev_num_draft_tokens.np[:num_reqs]
+                ),
+                _debug_array_summary(
+                    self.valid_sampled_token_count_cpu[:num_reqs]
+                ),
+            )
         correct_optimistic_seq_lens_cpu(
             self.optimistic_seq_lens_cpu.numpy(),
             self.prev_positions.np,
@@ -1780,6 +1900,12 @@ class NPUModelRunner(GPUModelRunner):
             self.valid_sampled_token_count_cpu.numpy(),
             num_reqs,
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[spec_decode/async_metadata] corrected optimistic seq_lens: "
+                "after=%s",
+                _debug_array_summary(self.optimistic_seq_lens_cpu[:num_reqs]),
+            )
 
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor

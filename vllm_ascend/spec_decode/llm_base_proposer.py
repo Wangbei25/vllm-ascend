@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
+import logging
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
@@ -83,6 +84,19 @@ def patch_tensor_parallel_group(tp_group):
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
+_SPEC_DECODE_DEBUG_PREVIEW = 16
+
+
+def _debug_tensor_summary(
+    tensor: torch.Tensor | None,
+    limit: int = _SPEC_DECODE_DEBUG_PREVIEW,
+) -> list[Any] | None:
+    if tensor is None:
+        return None
+    try:
+        return tensor.detach().flatten()[:limit].cpu().tolist()
+    except Exception as exc:  # pragma: no cover - best-effort diagnostics.
+        return [f"<summary failed: {exc}>"]
 
 
 # TODO: Remove it when the bug of fx-graph is solved
@@ -787,6 +801,31 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     ) -> torch.Tensor:
         batch_size = common_attn_metadata.batch_size()
 
+        if self.method == "mtp" and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[spec_decode/mtp_metadata] propose start: batch=%s "
+                "num_reqs=%s num_tokens=%s max_query_len=%s graph=%s "
+                "async=%s prefix_cache=%s req_ids=%s seq_lens=%s "
+                "seq_lens_cpu=%s canonical_seq_lens_cpu=%s "
+                "query_start=%s block_table_shape=%s block_table=%s "
+                "slot_mapping=%s",
+                batch_size,
+                common_attn_metadata.num_reqs,
+                common_attn_metadata.num_actual_tokens,
+                common_attn_metadata.max_query_len,
+                self.use_cuda_graph,
+                self.use_async_scheduling,
+                self.vllm_config.cache_config.enable_prefix_caching,
+                self.runner.input_batch.req_ids[:_SPEC_DECODE_DEBUG_PREVIEW],
+                _debug_tensor_summary(common_attn_metadata.seq_lens),
+                _debug_tensor_summary(common_attn_metadata.seq_lens_cpu),
+                _debug_tensor_summary(common_attn_metadata._seq_lens_cpu),
+                _debug_tensor_summary(common_attn_metadata.query_start_loc_cpu),
+                tuple(common_attn_metadata.block_table_tensor.shape),
+                _debug_tensor_summary(common_attn_metadata.block_table_tensor),
+                _debug_tensor_summary(common_attn_metadata.slot_mapping),
+            )
+
         if token_indices_to_sample is None:
             token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1
 
@@ -892,6 +931,28 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if common_attn_metadata.num_computed_tokens_cpu is not None:
                 common_attn_metadata.num_computed_tokens_cpu = self._adjust_tensor(
                     common_attn_metadata.num_computed_tokens_cpu, num_reqs_padded
+                )
+
+            if self.method == "mtp" and logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[spec_decode/mtp_metadata] full-graph padding: "
+                    "actual_reqs=%s padded_reqs=%s input_tokens=%s "
+                    "seq_lens=%s seq_lens_cpu=%s "
+                    "canonical_seq_lens_cpu=%s query_start=%s "
+                    "block_table_shape=%s block_table=%s",
+                    batch_size,
+                    num_reqs_padded,
+                    num_input_tokens,
+                    _debug_tensor_summary(common_attn_metadata.seq_lens),
+                    _debug_tensor_summary(common_attn_metadata.seq_lens_cpu),
+                    _debug_tensor_summary(common_attn_metadata._seq_lens_cpu),
+                    _debug_tensor_summary(
+                        common_attn_metadata.query_start_loc_cpu
+                    ),
+                    tuple(common_attn_metadata.block_table_tensor.shape),
+                    _debug_tensor_summary(
+                        common_attn_metadata.block_table_tensor
+                    ),
                 )
 
             if self.pcp_size > 1:
@@ -1819,6 +1880,47 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 block_numbers = clamped_positions[0] // block_size
             else:
                 block_numbers = clamped_positions // block_size
+
+            if logger.isEnabledFor(logging.DEBUG):
+                block_table_width = block_table_for_slot.shape[1]
+                invalid_table_index = (block_numbers < 0) | (
+                    block_numbers >= block_table_width
+                )
+                actual_reqs = min(
+                    batch_size,
+                    self.runner.input_batch.num_reqs,
+                    block_numbers.numel(),
+                )
+                allocated_blocks = self.runner.input_batch.block_table[
+                    attn_group.kv_cache_group_id
+                ].num_blocks_per_row[:actual_reqs]
+                requested_blocks = (
+                    block_numbers[:actual_reqs].detach().cpu().numpy()
+                )
+                invalid_allocation = requested_blocks >= allocated_blocks
+                if invalid_table_index.any().item() or invalid_allocation.any():
+                    logger.warning(
+                        "[spec_decode/mtp_metadata] invalid MTP block lookup: "
+                        "draft_index=%s req_ids=%s positions=%s "
+                        "block_numbers=%s allocated_blocks=%s "
+                        "block_table_width=%s block_table_shape=%s "
+                        "block_table=%s seq_lens=%s",
+                        draft_index,
+                        self.runner.input_batch.req_ids[
+                            :_SPEC_DECODE_DEBUG_PREVIEW
+                        ],
+                        _debug_tensor_summary(
+                            clamped_positions[0]
+                            if self.uses_mrope
+                            else clamped_positions
+                        ),
+                        _debug_tensor_summary(block_numbers),
+                        allocated_blocks[:_SPEC_DECODE_DEBUG_PREVIEW].tolist(),
+                        block_table_width,
+                        tuple(block_table_for_slot.shape),
+                        _debug_tensor_summary(block_table_for_slot),
+                        _debug_tensor_summary(common_attn_metadata.seq_lens),
+                    )
             block_ids = block_table_for_slot.gather(dim=1, index=block_numbers.view(-1, 1))
             block_ids = block_ids.view(-1)
             if self.uses_mrope:
@@ -1830,6 +1932,22 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Otherwise, the KV cache will be inadvertently updated with the
             # padding tokens.
             slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[spec_decode/mtp_metadata] draft slot mapping: "
+                    "draft_index=%s positions=%s block_numbers=%s "
+                    "block_ids=%s slot_mapping=%s seq_lens=%s",
+                    draft_index,
+                    _debug_tensor_summary(
+                        clamped_positions[0]
+                        if self.uses_mrope
+                        else clamped_positions
+                    ),
+                    _debug_tensor_summary(block_numbers),
+                    _debug_tensor_summary(block_ids),
+                    _debug_tensor_summary(slot_mapping),
+                    _debug_tensor_summary(common_attn_metadata.seq_lens),
+                )
             self.slot_mapping_group[draft_index][: slot_mapping.shape[0]].copy_(slot_mapping.to(torch.int32))
             self.slot_mapping_group[draft_index][slot_mapping.shape[0] :].fill_(PADDING_SLOT_ID)
             # Set the address of the attn_metadata.slot_mapping to the self.slot_mapping_group[idx]

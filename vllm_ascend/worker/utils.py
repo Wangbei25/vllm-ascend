@@ -1,8 +1,10 @@
+import logging
 from collections.abc import Iterable
 from itertools import product as iprod
 from typing import Any
 
 import torch
+from vllm.logger import logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import largest_power_of_2_divisor
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -65,6 +67,9 @@ class AscendKVBlockZeroer(KVBlockZeroer):
         self._id_cap: int = 0
         self._ids_pinned: torch.Tensor | None = None
         self._ids_gpu: torch.Tensor | None = None
+        self._debug_copy_event: torch.npu.Event | None = None
+        self._debug_zero_generation = 0
+        self._debug_last_block_ids: list[int] = []
 
     def init_meta(
         self,
@@ -156,6 +161,25 @@ class AscendKVBlockZeroer(KVBlockZeroer):
             return
         seg_addrs, page_size_el, blk_size, n_segs = self._meta
         n_blocks = len(block_ids)
+        debug_enabled = logger.isEnabledFor(logging.DEBUG)
+        if debug_enabled:
+            if (
+                self._debug_copy_event is not None
+                and not self._debug_copy_event.query()
+            ):
+                logger.warning(
+                    "[kv_zeroer/race] reusing the single block-ID staging "
+                    "buffer while its previous nonblocking H2D copy is in "
+                    "flight: "
+                    "previous_generation=%s current_generation=%s "
+                    "previous_block_ids=%s current_block_ids=%s",
+                    self._debug_zero_generation,
+                    self._debug_zero_generation + 1,
+                    self._debug_last_block_ids,
+                    block_ids[:16],
+                )
+            self._debug_zero_generation += 1
+            self._debug_last_block_ids = block_ids[:16]
         if n_blocks > self._id_cap:
             self._id_cap = n_blocks * 2
             self._ids_pinned = torch.empty(
@@ -168,6 +192,20 @@ class AscendKVBlockZeroer(KVBlockZeroer):
         self._ids_pinned[:n_blocks].numpy()[:] = block_ids
         idx = self._ids_gpu[:n_blocks]
         idx.copy_(self._ids_pinned[:n_blocks], non_blocking=True)
+        if debug_enabled:
+            logger.debug(
+                "[kv_zeroer/submit] generation=%s num_blocks=%s "
+                "block_ids=%s pinned_ptr=%s device_ptr=%s stream=%s",
+                self._debug_zero_generation,
+                n_blocks,
+                block_ids[:16],
+                self._ids_pinned.data_ptr(),
+                self._ids_gpu.data_ptr(),
+                torch.npu.current_stream(),
+            )
+            if self._debug_copy_event is None:
+                self._debug_copy_event = torch.npu.Event()
+            self._debug_copy_event.record(torch.npu.current_stream())
         chunks = page_size_el // blk_size
         total_work = n_blocks * n_segs * chunks
         grid = min(total_work, get_vectorcore_num()) if total_work > 0 else 0
