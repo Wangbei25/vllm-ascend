@@ -1371,7 +1371,7 @@ class NPUModelRunner(GPUModelRunner):
                 " num_reqs=%s total_tokens=%s use_async=%s prefix_cache=%s"
                 " query_start_cpu=%s seq_lens=%s optimistic_seq_lens_cpu=%s"
                 " positions=%s slot_mapping=%s num_draft_tokens=%s"
-                " scheduled_spec_req_count=%s",
+                " scheduled_spec_req_count=%s req_ids=%s block_table=%s",
                 num_reqs,
                 total_num_scheduled_tokens,
                 self.use_async_spec_decode,
@@ -1383,6 +1383,10 @@ class NPUModelRunner(GPUModelRunner):
                 _debug_array_summary(self.input_batch.block_table[0].slot_mapping.gpu[:total_num_scheduled_tokens]),
                 _debug_array_summary(num_draft_tokens),
                 len(scheduler_output.scheduled_spec_decode_tokens),
+                self.input_batch.req_ids[:num_reqs],
+                _debug_array_summary(
+                    self.input_batch.block_table[0].get_device_tensor(num_reqs)
+                ),
             )
         # save logits_indices for pcp spec decode usage
         self.logits_indices = logits_indices

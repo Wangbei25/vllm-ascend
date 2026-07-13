@@ -771,7 +771,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 " num_reqs=%s num_tokens=%s max_query_len=%s use_graph=%s"
                 " async=%s prefix_cache=%s seq_lens=%s seq_lens_cpu=%s"
                 " _seq_lens_cpu=%s query_start_cpu=%s block_table_shape=%s"
-                " slot_mapping=%s",
+                " block_table=%s slot_mapping=%s req_ids=%s",
                 self.method,
                 batch_size,
                 common_attn_metadata.num_reqs,
@@ -785,7 +785,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 _debug_tensor_summary(common_attn_metadata._seq_lens_cpu),
                 _debug_tensor_summary(common_attn_metadata.query_start_loc_cpu),
                 tuple(common_attn_metadata.block_table_tensor.shape),
+                _debug_tensor_summary(common_attn_metadata.block_table_tensor),
                 _debug_tensor_summary(common_attn_metadata.slot_mapping),
+                self.runner.input_batch.req_ids[: common_attn_metadata.num_reqs],
             )
 
         if token_indices_to_sample is None:
@@ -1825,6 +1827,24 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     )
             block_ids = old_common_metadata.block_table_tensor.gather(dim=1, index=block_numbers.view(-1, 1))
             block_ids = block_ids.view(-1)
+            if logger.isEnabledFor(logging.DEBUG) and (block_ids < 0).any().item():
+                logger.warning(
+                    "[spec_decode/mtp_metadata] invalid physical block id after"
+                    " MTP block-table gather: draft_index=%s req_ids=%s"
+                    " positions=%s block_numbers=%s block_ids=%s"
+                    " block_table_shape=%s block_table=%s",
+                    draft_index,
+                    self.runner.input_batch.req_ids[:batch_size],
+                    _debug_tensor_summary(
+                        clamped_positions[0]
+                        if self.uses_mrope
+                        else clamped_positions
+                    ),
+                    _debug_tensor_summary(block_numbers),
+                    _debug_tensor_summary(block_ids),
+                    tuple(old_common_metadata.block_table_tensor.shape),
+                    _debug_tensor_summary(old_common_metadata.block_table_tensor),
+                )
             if self.uses_mrope:
                 slot_mapping = block_ids * block_size + clamped_positions[0] % block_size
             else:
