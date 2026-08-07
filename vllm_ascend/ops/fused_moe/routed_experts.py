@@ -14,11 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from copy import copy
 from dataclasses import dataclass
+from functools import wraps
 from types import SimpleNamespace
-from typing import Literal, overload
 
 import torch
 import torch_npu
@@ -42,6 +42,40 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.ops.fused_moe.moe_utils import get_moe_num_logical_experts, zero_experts_compute
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
+
+_WEIGHT_LOADER_NAME_MAP = {
+    "w13_scale_bias": "w13_scale",
+    "w2_scale_bias": "w2_scale",
+}
+
+
+def _make_weight_name_mapped_loader(
+    weight_loader: Callable[..., bool | None],
+) -> Callable[..., bool | None]:
+    """Map Ascend parameter names before delegating to the upstream loader."""
+
+    @wraps(weight_loader)
+    def mapped_weight_loader(
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+        return_success: bool = False,
+    ) -> bool | None:
+        prefix, separator, param_name = weight_name.rpartition(".")
+        mapped_name = _WEIGHT_LOADER_NAME_MAP.get(param_name, param_name)
+        mapped_weight_name = f"{prefix}{separator}{mapped_name}"
+        return weight_loader(
+            param=param,
+            loaded_weight=loaded_weight,
+            weight_name=mapped_weight_name,
+            shard_id=shard_id,
+            expert_id=expert_id,
+            return_success=return_success,
+        )
+
+    return mapped_weight_loader
 
 
 @dataclass
@@ -270,54 +304,14 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             self.e_score_correction_bias.data = self.e_score_correction_bias.data.to(
                 dtype=vllm_config.model_config.dtype
             )
-
-    @overload
-    def weight_loader(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-        return_success: Literal[False],
-    ) -> None: ...
-
-    @overload
-    def weight_loader(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-        return_success: Literal[True],
-    ) -> bool: ...
-
-    def weight_loader(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-        return_success: bool = False,
-    ) -> bool | None:
-        # Ascend W4A8 uses scale_bias as a grouped quantization parameter.
-        # Upstream's expert-bias branch matches every name containing "bias",
-        # which would bypass the grouped-scale TP sharding for these tensors.
-        # Keep upstream's loading implementation, but dispatch scale_bias
-        # through its scale path instead of its expert-bias path.
-        param_name = weight_name.rsplit(".", 1)[-1]
-        if param_name in ("w13_scale_bias", "w2_scale_bias"):
-            weight_name = weight_name.removesuffix("_bias")
-        return super().weight_loader(
-            param=param,
-            loaded_weight=loaded_weight,
-            weight_name=weight_name,
-            shard_id=shard_id,
-            expert_id=expert_id,
-            return_success=return_success,
-        )
+        # scale_bias tensors are grouped quantization parameters, but the
+        # upstream loader classifies names containing "bias" as expert biases.
+        # Keep the inherited loader and map only the affected parameter names
+        # at the parameter boundary.
+        for param_name in _WEIGHT_LOADER_NAME_MAP:
+            param = getattr(self, param_name, None)
+            if param is not None:
+                param.weight_loader = _make_weight_name_mapped_loader(param.weight_loader)
 
     def get_expert_weights(self) -> Iterable[torch.Tensor]:
         try:
